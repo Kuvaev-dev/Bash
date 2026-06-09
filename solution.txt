@@ -1,0 +1,109 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+// ========== НАСТРОЙКИ ==========
+const (
+	offDuration      = 120 * time.Second   // На сколько выключать USB
+	cycleIntervalMin = 180 * time.Minute   // Периодичность циклов
+)
+// ===============================
+
+func main() {
+	// Расчет времени ожидания после включения
+	waitAfterOn := cycleIntervalMin - offDuration
+	if waitAfterOn < 0 {
+		waitAfterOn = 0
+	}
+
+	fmt.Println("=== Управление питанием USB (Raspberry Pi 5) ===")
+	fmt.Printf("Отключение на %.0f сек, повтор каждые %.0f мин\n", offDuration.Seconds(), cycleIntervalMin.Minutes())
+	fmt.Println("Остановить: Ctrl+C (USB будет включён обратно)")
+	fmt.Println("================================================")
+
+	// 1. Проверка прав root (EUID == 0)
+	if os.Geteuid() != 0 {
+		fmt.Fprintf(os.Stderr, "ОШИБКА: запустите с правами sudo\n")
+		os.Exit(1)
+	}
+
+	// 2. Проверка утилиты uhubctl
+	if _, err := exec.LookPath("uhubctl"); err != nil {
+		fmt.Fprintf(os.Stderr, "ОШИБКА: утилита uhubctl не установлена.\n")
+		fmt.Fprintf(os.Stderr, "Установите: sudo apt update && sudo apt install -y uhubctl\n")
+		os.Exit(1)
+	}
+
+	// 3. Перехват сигналов (Ctrl+C, SIGTERM) для безопасного выхода
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Канал для управления основным циклом
+	done := make(chan bool, 1)
+
+	go func() {
+		sig := <-sigChan
+		fmt.Printf("\nПолучен сигнал %v. Включаем USB...\n", sig)
+		usbOnAll()
+		fmt.Println("Скрипт завершён.")
+		done <- true
+	}()
+
+	// 4. Основной цикл выполнения
+	go func() {
+		for {
+			usbOffAll()
+			time.Sleep(offDuration)
+
+			usbOnAll()
+
+			if waitAfterOn > 0 {
+				fmt.Printf("Ожидание %.0f сек до следующего цикла...\n", waitAfterOn.Seconds())
+				time.Sleep(waitAfterOn)
+			}
+		}
+	}()
+
+	// Блокируем главный поток, пока не придет сигнал остановки
+	<-done
+}
+
+// Функция отключения всех 4 хабов
+func usbOffAll() {
+	timestamp := time.Now().Format("15:04:05")
+	fmt.Printf("%s - Выключаем питание USB (хабы 1-4)...\n", timestamp)
+
+	for hub := 1; hub <= 4; hub++ {
+		fmt.Printf("  Отключаю хаб %d...\n", hub)
+		// Запуск внешней команды: uhubctl -l <hub> -a 0
+		cmd := exec.Command("uhubctl", "-l", fmt.Sprintf("%d", hub), "-a", "0")
+		
+		// Подавляем stderr, как в оригинальном скрипте (2>/dev/null)
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("    (хаб %d не поддерживает отключение или уже выключен)\n", hub)
+		}
+	}
+}
+
+// Функция включения всех 4 хабов
+func usbOnAll() {
+	timestamp := time.Now().Format("15:04:05")
+	fmt.Printf("%s - Включаем питание USB (хабы 1-4)...\n", timestamp)
+
+	for hub := 1; hub <= 4; hub++ {
+		fmt.Printf("  Включаю хаб %d...\n", hub)
+		// Запуск внешней команды: uhubctl -l <hub> -a 1
+		cmd := exec.Command("uhubctl", "-l", fmt.Sprintf("%d", hub), "-a", "1")
+		
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("    (хаб %d не поддерживает включение или уже включён)\n", hub)
+		}
+	}
+}
